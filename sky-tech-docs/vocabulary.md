@@ -16,3 +16,9 @@ Software Engineering & System Design:
 Ad hoc is a Latin phrase that literally means "for this" or "for this purpose."
 
 4. TL;DR stands for "too long; didn't read"
+
+5. prose
+Prose simply means language that follows the natural patterns found in everyday speech.
+
+6. needle in a haystack - idiom
+The idiom "a needle in a haystack" means something that is extremely difficult or nearly impossible to find, usually because the object is very small and the area or collection you have to search is way too large.

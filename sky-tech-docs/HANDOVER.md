@@ -1,7 +1,7 @@
 # Sky Custom Reports: Handover Guide
 
 > **Sources:** `handover-en.pdf` (Draft v1, written by Sergei Privalov, Backend Engineer and project owner, when he left) plus running notes from the client call in `notes.md`.
-> **Audience:** the next owner of the `sky-custom-reports` service. It assumes you do **not** already know the tech stack. Read §2 (Client Call) to see *what the client cares about*, and §4 (Tech Stack) and §16 (Vocabulary) if names like *Genkit*, *BullMQ* or *Prisma* are new to you.
+> **Audience:** the next owner of the `sky-custom-reports` service. It assumes you do **not** already know the tech stack. Read §2 (Client Call) to see *what the client cares about*, and §4 (Tech Stack) and §18 (Vocabulary) if names like *Genkit*, *BullMQ* or *Prisma* are new to you.
 > **Note:** some parts are *my reading* of the system rather than statements from the handover. They are marked as such.
 
 ---
@@ -23,9 +23,11 @@
 13. [Testing and Evaluation](#13-testing-and-evaluation)
 14. [Incident History and Known Problems](#14-incident-history-and-known-problems)
 15. [Pending Work, Recommendations and Routine Ops](#15-pending-work-recommendations-and-routine-ops)
-16. [Vocabulary / Glossary](#16-vocabulary--glossary)
-17. [Access Checklist](#17-access-checklist)
-18. [Appendix: Key Paths and Links](#18-appendix-key-paths-and-links)
+16. [Q&A: Deeper Explanations](#16-qa-deeper-explanations)
+17. [Open Questions Checklist](#17-open-questions-checklist)
+18. [Vocabulary / Glossary](#18-vocabulary--glossary)
+19. [Access Checklist](#19-access-checklist)
+20. [Appendix: Key Paths and Links](#20-appendix-key-paths-and-links)
 
 ---
 
@@ -350,6 +352,8 @@ flowchart LR
 - **Relevance:** runs in batches, uses `relevanceCache`, and **fails open**: if a batch errors, its pages are kept.
 - **Fetch:** reads S3 directly. For large volumes, sky-rag (`POST /v1/tenants/{org}/cases/{case}/context`) acts as a **page-selection filter**. This is a compromise, not full RAG.
 
+> **How pages are selected, and what's redone on every report vs done once:** see the Q&A in §16.3.
+
 ### 7.2 Stages, part 2: facts
 
 ```mermaid
@@ -393,6 +397,8 @@ flowchart LR
 
 Each "reading" call sees only one chunk, so no single call has to hold the whole case. *My reading:* the limit doesn't disappear, it moves. All the merged facts for a section must still fit into the final writing call. The handover gives no number for how many facts that is, and that is exactly what the client is asking ("how large is our context capability?").
 
+> **Why the model's published context size doesn't answer the client's question:** see the Q&A in §16.1.
+
 ### 7.6 Where a critical fact can get lost
 
 *My reading of the pipeline; the handover doesn't list these.*
@@ -417,6 +423,8 @@ flowchart LR
 | Cross-section dispatch | When enabled, a fact is assigned to another section. This is correct, unless that section drops it. |
 
 No current metric directly counts facts lost at each stage. `factsBeforeDispatch`/`factsAfterDispatch` and `source_coverage` (§12) are partial signals.
+
+> **What these metrics mean, and how to measure fact loss properly:** see the Q&A in §16.2.
 
 ---
 
@@ -513,6 +521,8 @@ flowchart LR
     B -- no --> D[⚠️ Snapshot expired<br/>section fails]
 ```
 
+> **What section snapshots contain, why they're used, and when they're rebuilt:** see the Q&A in §16.5.
+
 ---
 
 ## 11. Infrastructure and Deployment
@@ -595,6 +605,8 @@ flowchart LR
 | `cross_section_dedup` | Cross-section dedup | `reportId`, `runId` |
 | `orphan_reconciled` | Row moved to failed by reconciler | `entityType`, `entityId`, `jobState` |
 | `evaluation_result` | Eval run result | `evaluatorName`, `score`, `passed` |
+
+> What the fact-related metrics (`factsBefore/AfterDispatch`, `source_coverage`, `fact_attribution`) do and don't measure is explained in §16.2.
 
 ### 12.2 How to trace a failed generation
 
@@ -704,6 +716,8 @@ flowchart LR
 
 Today, facts are re-extracted on every run and thrown away afterwards. Persisting them would make repeat generations cheaper, fit agentic report composition, and help with the core quality problem in §7. It also maps onto the product goal of iterating cheaply from 75% to 95% (§1).
 
+> **What "agentic report composition" means, and how a fact store could work in practice:** see the Q&A in §16.4.
+
 ### 15.3 Routine operations
 
 | Task | How |
@@ -730,7 +744,428 @@ Today, facts are re-extracted on every run and thrown away afterwards. Persistin
 
 ---
 
-## 16. Vocabulary / Glossary
+## 16. Q&A: Deeper Explanations
+
+Longer answers to questions raised while reading this handover. Each one links back to the section it expands on.
+
+### 16.1 Context window sizes are public, so why does the client keep asking "how large is our context capability?"
+
+*Expands on §7.5.*
+
+*My explanation; the handover and the call don't spell this out.*
+
+Every model's context window is published, and it changes with each new model. But the client is asking how much **the Sky system** can reliably handle, and that has to be measured. *Analogy:* a van's engine power is in the spec sheet, but "how much cargo can our van carry on this route without dropping boxes?" is a different question.
+
+```mermaid
+flowchart LR
+    A[Advertised<br/>window<br/>public] --> B[Usable for<br/>many-fact<br/>extraction]
+    B --> C[Limited by<br/>pipeline design]
+    C --> D[Affordable<br/>at report scale]
+    D --> E[Real system<br/>capacity<br/>must be measured]
+```
+
+| Reason | What it means |
+|---|---|
+| **Advertised ≠ usable** | The published number is the most a model will *accept*. Quality drops well before that: models use details near the start and end of long inputs but miss things in the middle ("lost in the middle"). Public tests such as "needle in a haystack" check finding **one** fact. A medical summary needs **hundreds of facts at once**, which is harder. |
+| **Output is the tighter limit** | Models can read far more than they can write in one call. Long reports (the call mentions the 10–20 page range) can hit output limits even when the input fits. |
+| **The pipeline sets its own limits** | Chunk sizes, the 400-page fan-out threshold, the relevance filter, sky-rag page selection, how hard facts are merged, and how many facts the final writing call can hold. Validated only to **~1000 pages**. None of this is public. |
+| **The fallback chain counts** | A prompt may run on Gemini, fall back to Claude, or use Vertex AI (NA). These models have different windows and long-input quality. *My inference:* effective capacity may be set by the **weakest model in a prompt's chain**. Check this against the model settings in `config.json`. |
+| **Cost is a limit too** | The client said context **isn't getting cheaper** as hoped. A case that technically fits may still be unaffordable across ~50 sections, retries and reruns. Practical capacity is "what fits **at a price customers will pay**". |
+
+**Why the client keeps asking:**
+- **To sell honestly:** for example, "cases up to N pages capture X% of key facts, at about $Y per report".
+- **To diagnose failures:** to tell whether a missing fact is a context limit or something else (§2.5).
+- **To scale:** larger customers bring 5–10k-page cases, which are unvalidated.
+
+**What a good answer looks like:** a **measured curve**, not a model spec. Run cases of growing size (100 → 500 → 1000 → 5000 pages) and record recall (share of expected facts that appear), time and cost. Where recall starts to drop is the system's real capacity.
+
+```mermaid
+flowchart LR
+    A[Cases of<br/>growing size] --> B[Generate<br/>reports]
+    B --> C[Compare with<br/>gold facts]
+    C --> D[Recall · time ·<br/>cost per size]
+    D --> E[Point where<br/>recall drops =<br/>real capacity]
+```
+
+### 16.2 What do `factsBeforeDispatch` / `factsAfterDispatch` and the other fact metrics mean, and why are they only "partial signals"?
+
+*Expands on §7.6.*
+
+#### What today's fact metrics actually measure
+
+> **Caveat:** the handover only lists these field names (§12.1); it doesn't explain them. The meanings below are my reading of the names and the feature they belong to. Confirm them where the metrics are set in the workers code (`workers/src/infra/metrics.ts` defines them). The handover's list may also not include everything the code logs.
+
+| Metric / field | Probable meaning | What it tells you | What it doesn't tell you |
+|---|---|---|---|
+| `factsBeforeDispatch` / `factsAfterDispatch` (on `job_completion`) | Facts a section had **before and after** cross-section dispatch, the step that sends each fact to the section where it belongs and removes cross-section duplicates (`CROSS_SECTION_DEDUP_ENABLED`) | How much re-routing and dedup happened | Whether a drop means facts *moved* (fine) or were *lost* |
+| `source_coverage` (`coverageRate = coveredFacts / totalFacts`) | Share of facts **in the output** that have a citation | **Grounding:** are the facts we wrote backed up? | **Completeness:** did we write everything important? |
+| `fact_attribution` (`pagePercentage`, `summaryPercentage`) | Share of facts from page content vs document summaries | How much the old summary path is still used | Anything about missing facts |
+
+How dispatch counting works, as an example:
+
+```mermaid
+flowchart LR
+    A[Diagnosis section<br/>extracts 120 facts<br/>factsBeforeDispatch=120] --> B[Dispatch:<br/>30 → Treatment<br/>10 duplicates]
+    B --> C[Diagnosis keeps 80<br/>factsAfterDispatch=80]
+```
+
+#### Why these are only "partial signals"
+
+To answer "where did we lose a critical fact?", you need a count at **every stage**, like a sales funnel. Today most stages are uncounted:
+
+| Stage | Counted today? |
+|---|---|
+| Facts that exist in the documents | ✗ Unknown without a gold report |
+| Pages marked relevant | ✗ Not in the metric list |
+| Facts extracted from chunks | ✗ Not in the metric list |
+| Facts after merge/condense | ✗ Not in the metric list |
+| Facts before/after dispatch | ✓ `factsBefore/AfterDispatch` |
+| Facts in the final prose | ~ `totalFacts` in `source_coverage` |
+| Of those, cited | ✓ `source_coverage` |
+
+1. **The biggest losses happen before anything is counted.** If relevance wrongly drops a page, its facts are never extracted, so no counter ever sees them.
+2. **The existing counters measure other things:** dispatch counts measure re-routing, and coverage measures citations.
+3. **A report can score perfectly and still miss key facts.** If only 40 of 100 important facts reach the report but all 40 are cited, `source_coverage` shows **100%**.
+
+#### What would close the gap
+
+*My suggestions.*
+
+```mermaid
+flowchart LR
+    A[1. Count after<br/>every stage] --> B[2. Recall vs<br/>gold reports]
+    B --> C[3. Keep dropped<br/>pages + facts<br/>for tracing]
+```
+
+1. **Log a count after every stage:** pages in → pages relevant → facts extracted → facts after merge → facts after dispatch → facts in the final text. This shows *where* numbers drop, for example "merge cut 300 facts down to 90".
+2. **Measure recall against gold reports.** The only way to count facts that were *never* extracted is to compare with a human-made list of facts that should be there. The report-gold eval (SKY-3944, §13) is set up for this, so report recall as its own number.
+3. **Keep the dropped items, not just counts.** Store which pages were marked irrelevant and which facts were merged away. When a doctor says "the 2023 MRI is missing", you can trace exactly where it was lost. This is the traceability the client asked for (§2.5).
+
+### 16.3 How are relevant pages chosen from S3, and are chunking and embedding redone for every report?
+
+*Expands on §7.1.*
+
+#### Part A: How relevant pages are chosen
+
+**What the handover says.** S3 is only **storage**; nothing is searched for in it. The system starts from the **doclist** (all documents and pages of the case) and reads each page's markdown from S3 by its known location, the way you open a filing-cabinet drawer you already know about.
+
+```mermaid
+flowchart LR
+    A[Case ID] --> B[Doclist<br/>all docs + pages]
+    B --> C[Group pages<br/>into chunks]
+    C --> D[LLM: which pages<br/>are relevant?]
+    D --> E[Load chosen<br/>pages from S3]
+```
+
+```mermaid
+flowchart LR
+    L[Large case] --> R[sky-rag vector search<br/>narrows the pages]
+    R --> E[Load chosen<br/>pages from S3]
+```
+
+- **Relevance is decided by the LLM, per section.** `detectRelevanceStep` asks the model, in batches, which pages matter to the section. It uses `relevanceCache` and is fail-open: on a batch error the pages are kept.
+- **Vector search is used only for big cases.** sky-rag (`POST /v1/tenants/{org}/cases/{case}/context`) narrows the pages. Sergei calls it "a page-selection filter… a compromise, not a full RAG context".
+
+**What the handover leaves out:**
+
+| Gap | Note |
+|---|---|
+| Where the doclist comes from | Only "the service fetches the case document list". `usesky-api` (`core-api.client.ts`) is a likely source; that isn't stated. |
+| How pages become markdown in S3 | Some upstream step converts documents (and probably runs OCR). It isn't described. |
+| What the relevance step reads | The order is chunk → relevance → fetch pages, so relevance seems to be decided **before** full page text is loaded. It may use page summaries or doclist details. This matters for "missing facts": a page judged on a thin summary is easier to wrongly drop (§7.6). |
+
+**How other RAG applications usually do it** *(general practice, not Sky-specific)*:
+
+```mermaid
+flowchart LR
+    subgraph ING["Ingest: once per document"]
+      U[Upload] --> X[Text extraction<br/>/ OCR] --> S[Split into<br/>chunks] --> EM[Embed] --> V[(Vector store<br/>+ metadata)]
+    end
+```
+
+```mermaid
+flowchart LR
+    subgraph QRY["Query: each request"]
+      Q[Question /<br/>section] --> QE[Embed it] --> SS[Similarity search<br/>filtered by tenant + case] --> K[Top-k chunks] --> RR[Optional<br/>rerank] --> LLM[LLM]
+    end
+```
+
+Common extras are **hybrid search** (keyword plus vector), **metadata filters** (so one client never sees another's data) and **reranking**. *Key difference:* for most cases Sky **doesn't rely on vector search**. An LLM judges relevance page by page, which is slower and costs more, but is less likely to miss things.
+
+#### Part B: What's redone on every report, and what's done once
+
+"Chunking" means two different things here:
+
+| Meaning | Where | When |
+|---|---|---|
+| **Pipeline chunking:** grouping pages into batches for LLM calls | This service, stage 1 (§7.1) | **Every report, per section** |
+| **RAG chunking:** splitting text into pieces and embedding them | sky-rag (separate service) | **Not described** |
+
+| Step | Per report or once? | Source |
+|---|---|---|
+| Doclist + section snapshots prepared in Redis (4h) | Per report | Stated |
+| Grouping pages into chunks | Per report, per section | Stated (pipeline stage) |
+| LLM relevance check | Per report; `relevanceCache` may reuse earlier answers | Cache stated; how long it lasts isn't |
+| Fact extraction | **Every generation** | Stated: "facts are re-extracted on every generation" |
+| Page text → markdown in S3 | Probably once, upstream | *My inference* |
+| Embedding + vector storage | Probably once, in sky-rag | *My inference* |
+
+```mermaid
+flowchart LR
+    subgraph ONCE["Probably once (upstream / sky-rag)"]
+      A[Pages → markdown<br/>in S3] --> B[Embed + index<br/>in sky-rag]
+    end
+    subgraph EVERY["Every report"]
+      C[Chunk pages] --> D[Relevance<br/>LLM + cache] --> E[Extract facts<br/>LLM]
+    end
+    ONCE --> EVERY
+```
+
+*Why "probably once":* the sky-rag endpoint **queries** an existing case (`/tenants/{org}/cases/{case}/context`), which suggests the case was indexed beforehand, likely at upload. This service doesn't embed anything itself.
+
+**Why it matters:** the clearly stated per-request costs are **relevance checks and fact extraction**, both LLM work. That is the reason behind Sergei's "facts as a persistent data layer" recommendation (§15.2): repeat generations and 75% → 95% iterations wouldn't need to re-read every page.
+
+> **Open questions** from this answer are tracked in the consolidated checklist: §17, Q2–Q7.
+
+### 16.4 What is "agentic report composition", and how would persistent facts work with it?
+
+*Expands on §15.2 (Sergei's "facts as a persistent data layer"). **Not built yet.** This is a design discussion: my reasoning based on that recommendation.*
+
+#### What "agentic report composition" means
+
+Sergei's wording: "an agent picks relevant fact clusters and composes the report, instead of a rigid linear pipeline." An **agent** is an LLM that can call tools (search, database queries, write and check), look at the results and decide its next step.
+
+```mermaid
+flowchart LR
+    subgraph TODAY["Today: fixed pipeline"]
+      A[Pages] --> B[Relevance] --> C[Extract] --> D[Merge] --> E[Write]
+    end
+```
+
+```mermaid
+flowchart LR
+    subgraph AGENT["Agentic: plan → act → check"]
+      P[Plan section] --> Q[Query<br/>fact store]
+      Q --> G{Gaps or<br/>conflicts?}
+      G -- yes --> R[Re-read those<br/>source pages]
+      R --> Q
+      G -- no --> W[Write with<br/>citations]
+    end
+```
+
+| Helps with (client concerns) | Trade-offs |
+|---|---|
+| Missing facts: the agent can notice gaps and go back | Less predictable: each run can take a different path, which makes QA harder |
+| Duplicates and order: every section draws from one shared, deduplicated set of facts | Cost and time are harder to cap |
+| 75% → 95%: fixes become targeted queries, not full reruns | Needs strong evals and guardrails |
+
+#### The basic flow
+
+```mermaid
+flowchart LR
+    R[Report request] --> X{Facts for<br/>this case stored?}
+    X -- no --> P[Run extraction<br/>+ persist facts]
+    X -- yes --> S[Search<br/>stored facts]
+    P --> S
+    S --> C[Compose report]
+```
+
+When stored facts have a gap or a conflict, the agent re-checks the **source pages** and updates the store.
+
+#### Refinement 1: go back to the raw pages, not the section snapshot
+
+The section snapshot (§10) is the wrong source to re-check:
+- It's **temporary** (4h TTL) and **tied to one report**, not to the case.
+- It's probably a **reference** to the doclist, not the page content.
+- *My reading:* it's built **before** the relevance step, so it probably isn't filtered by relevance. Relevance results go to `relevanceCache`.
+
+**The lasting source is the doclist plus the page markdown in S3**, searchable through sky-rag.
+
+#### Refinement 2: facts saved from today's pipeline keep its blind spots
+
+Today, facts are extracted **per section**, and only from pages judged relevant to that section. Saving them as they are also saves the gaps: a wrongly dropped page never had its facts extracted.
+
+| Option | How |
+|---|---|
+| **Case-level extraction** | Read every page once, independent of any template. Save all facts with type, date, document and page. Sections then *query* the store. |
+| **Coverage record** | Alongside the facts, record which pages were read, and which were judged irrelevant for which section, so the agent knows what it **hasn't** seen. |
+
+#### Refinement 3: "missing" must be detectable
+
+The agent can't spot a gap just by looking at the facts it has. It needs a signal:
+
+| Signal | Example |
+|---|---|
+| Pages never processed | From the coverage record |
+| Template field with no matching facts | "No surgery dates found" |
+| Gaps in a chronology | No entries between 2021 and 2023 |
+| Reviewer feedback | "The 2023 MRI is missing" |
+
+Then it re-reads **only those pages**, not the whole case. This is what makes 75% → 95% cheap.
+
+#### Two more things to plan for
+
+- **New documents added to a case:** process only the new pages and add their facts to the store (incremental processing).
+- **Versioning:** tag each stored fact with the prompt and model version that extracted it, so outdated facts can be found when extraction improves.
+
+#### The full picture
+
+```mermaid
+flowchart LR
+    subgraph EXT["Extract: once per case + new pages"]
+      S3[S3 pages] --> EX[Extract facts] --> FS[(Fact store<br/>+ coverage<br/>+ versions)]
+    end
+```
+
+```mermaid
+flowchart LR
+    subgraph CMP["Compose: each report / re-run"]
+      AG[Agent] --> QF[Query fact store<br/>per section]
+      QF --> GP{Gap or<br/>conflict?}
+      GP -- yes --> RR[Re-read only<br/>those pages] --> QF
+      GP -- no --> WR[Write section<br/>with citations]
+    end
+```
+
+### 16.5 What are "section snapshots", why are they used, and are they rebuilt every time?
+
+*Expands on §6 and §10.*
+
+#### What the handover says (and doesn't)
+
+The only statements are:
+
+> `reportsGenerationWorker`: "prepares doclist and section snapshots in Redis (TTL 4h), enqueues a job per section"
+> Redis keys `report:prepared-doclist:*` and `report:section-snapshot:*`, TTL 4h. "If a report sits in the queue longer than the TTL, snapshots expire."
+
+It **doesn't list what a snapshot contains**. From the name and how it's used, it's most likely a **frozen copy of everything one section job needs to start**:
+
+| Key | Probably contains *(my inference)* |
+|---|---|
+| `report:prepared-doclist:*` | The case's document and page list, fetched and prepared **once per report** and shared by all its sections |
+| `report:section-snapshot:*` | One section's own inputs: its template definition (title, instructions, `contextType`), report settings, and a reference to the prepared doclist |
+
+#### How it flows
+
+```mermaid
+flowchart LR
+    R[Report job<br/>once per report] --> D[(prepared-doclist<br/>4h)]
+    R --> S[(section-snapshot<br/>× each section, 4h)]
+    R --> Q[Enqueue small<br/>section jobs<br/>IDs only]
+```
+
+```mermaid
+flowchart LR
+    J[Section job<br/>or its retry] --> S[(Its snapshot)]
+    J --> D[(Shared doclist)]
+    S --> P[LLM pipeline]
+    D --> P
+```
+
+#### Why it's used
+
+*Usual reasons for this pattern; the handover doesn't state them.*
+
+| Reason | Explanation |
+|---|---|
+| **Fetch once, share many times** | ~50 sections would otherwise each fetch the same doclist (50× calls to usesky-api / S3). |
+| **Freeze the inputs** | "Snapshot" means a point-in-time copy. If the template is edited or a document is added mid-generation, every section still uses the **same version**. |
+| **Keep queue jobs small** | BullMQ stores jobs in Redis too. Jobs carry IDs pointing to snapshot keys instead of a large doclist each. |
+| **Consistent retries** | A retried section job reads the **same** snapshot, so it starts from identical inputs. |
+| **Automatic cleanup** | The 4h TTL lets Redis delete them on its own. |
+
+#### Is it repeated?
+
+| Situation | Rebuilt? |
+|---|---|
+| Each new report generation, including regenerating the same case | **Yes, new snapshots each time.** They're prepared by the report job, which runs per report request. |
+| The ~50 section jobs of one report | **No.** Built once and read by each section job. |
+| A section job retry | **No.** It reads the existing snapshot, as long as it's within 4h. |
+| Reuse across different reports | Not stated. Probably not, since the keys look report-scoped. |
+| A report job retry | Not stated. It might rebuild the snapshots. |
+
+Building snapshots is cheap: it's data preparation, not LLM work. The expensive repeated part is what happens *after* the snapshot, the relevance checks and fact extraction (§16.3).
+
+#### Weak points
+
+| Risk | Source |
+|---|---|
+| **The 4h TTL:** if a section job waits longer, for example during a backlog or an LLM outage with retries, its snapshot is gone and the section fails | Stated |
+| **Redis restarts:** if Redis restarts without saving its data to disk, in-progress snapshots are lost. Check the Redis configuration | *My inference* |
+| **Memory:** large doclists × many reports running at once all sit in Redis memory | *My inference* |
+| **Not filtered by relevance, and not a long-term source:** built **before** the relevance step, temporary and report-scoped, so not the place to re-check facts (§16.4) | *My reading* |
+| **The same word used twice:** `contextType = snapshot` (the normal kind of section, written from page content) is a separate use of the word; how the two relate isn't stated | Naming |
+
+```mermaid
+flowchart LR
+    A[Snapshot saved] --> B{Section job runs<br/>within 4h?}
+    B -- yes --> C[OK]
+    B -- no --> D[Snapshot expired<br/>section fails]
+```
+
+> **Open questions** from this answer are tracked in the consolidated checklist: §17, Q8–Q13 and Q16.
+
+---
+
+## 17. Open Questions Checklist
+
+Every open question raised in this handover, in one place. These are **things to find out**. Work to be done is in §15.1, and access to request is in §19.
+
+```mermaid
+flowchart LR
+    A[Ask client] --> B[Ask Sergei /<br/>service owners]
+    B --> C[Confirm<br/>in code]
+    C --> D[Ask DevOps]
+    D --> E[Measure]
+```
+
+### 17.1 Ask the client
+
+| ✔ | # | Question | Why it matters | Ref |
+|---|---|---|---|---|
+| [ ] | Q1 | What does "org-wide context" mean: settings, instructions or reference material shared across a client organisation? | Shapes what users should provide as input to make output predictable | §2.5 |
+
+### 17.2 Ask Sergei or the owners of other services
+
+| ✔ | # | Question | Ask | Why it matters | Ref |
+|---|---|---|---|---|---|
+| [ ] | Q2 | Where does the doclist come from, and what does it contain (page summaries, metadata)? | Sergei / usesky-api owner | It's the starting point for every report | §16.3 |
+| [ ] | Q3 | What does `detectRelevanceStep` read to judge a page: full text, a summary, or metadata? | Sergei | A page judged on a thin summary is easier to wrongly drop, which is the client's #1 concern | §16.3, §7.6 |
+| [ ] | Q4 | How long does `relevanceCache` last, and what is its key (case, section, template)? | Sergei | Decides what's reused across runs vs redone | §16.3 |
+| [ ] | Q5 | Who converts documents to markdown in S3, and when? | Sergei / upstream owner | Bad conversion (e.g. OCR errors) loses facts before the pipeline starts | §16.3 |
+| [ ] | Q6 | When does sky-rag embed a case's pages (at upload or on demand), and how does it split them? | sky-rag owner | Confirms whether embedding is done once or per request | §16.3 |
+| [ ] | Q7 | At what page count does sky-rag filtering switch on? | Sergei | Above it, pages sky-rag doesn't pick are never read | §16.3, §7.6 |
+| [ ] | Q8 | How do `contextType = snapshot` and section snapshots in Redis relate, if at all? | Sergei | The same word is used for two things | §16.5 |
+
+### 17.3 Confirm in the code
+
+| ✔ | # | Question | Where to look | Ref |
+|---|---|---|---|---|
+| [ ] | Q9 | What exactly is written to `report:section-snapshot:*` and `report:prepared-doclist:*`? | Report-generation worker | §16.5 |
+| [ ] | Q10 | What is the full snapshot key format: per report, per section, or both? | Report-generation worker | §16.5 |
+| [ ] | Q11 | What happens when a snapshot is missing: a clear error, a rebuild, or a hang? | Section worker | §16.5 |
+| [ ] | Q12 | Is the 4h TTL configurable, and is it ever extended (e.g. on retry)? | Report worker, `packages/queues` | §16.5 |
+| [ ] | Q13 | Does a report job retry rebuild the snapshots? | Report worker, `job-options.ts` | §16.5 |
+| [ ] | Q14 | What do `factsBefore/AfterDispatch`, `source_coverage` and `fact_attribution` actually count? Does the code log fact metrics not listed in the handover? | `workers/src/infra/metrics.ts` and where they're emitted | §16.2 |
+| [ ] | Q15 | What models does each prompt use (main, fallback, vertex-ca), and what are their input and output limits? Is any chain limited by a weaker fallback? | `config.json` in `sky-prompts` | §16.1 |
+
+### 17.4 Ask DevOps / check infrastructure
+
+| ✔ | # | Question | Why it matters | Ref |
+|---|---|---|---|---|
+| [ ] | Q16 | Is Redis configured to save data to disk, so it survives restarts? | Otherwise in-progress snapshots and queued jobs are lost | §16.5, §10 |
+| [ ] | Q17 | Is the Genkit memory growth real? Track worker memory over time between restarts | Decides whether to replace Genkit | §8.1, §14 |
+
+### 17.5 Measure (nobody knows yet)
+
+| ✔ | # | Question | How | Ref |
+|---|---|---|---|---|
+| [ ] | Q18 | How many facts can the final writing call hold before quality drops? | Feed sections with growing fact counts; compare output to gold facts | §7.5 |
+| [ ] | Q19 | At what case size does recall start to drop, and what do time and cost look like? | Run 100 → 500 → 1000 → 5000-page cases against gold facts | §16.1 |
+
+---
+
+## 18. Vocabulary / Glossary
 
 ### Domain / product terms
 
@@ -741,7 +1176,8 @@ Today, facts are re-extracted on every run and thrown away afterwards. Persistin
 | **Template** | Blueprint of a report: its list of sections and instructions for each. Can be generated from a sample PDF. |
 | **Section** | One part of a report (a template may have ~50). Generated independently. |
 | **Doclist** | The list of documents (and their pages) in a case. |
-| **Snapshot (section)** | A frozen copy of the inputs a section job needs, stored in Redis for 4h. Also the default `contextType`. |
+| **Snapshot (section)** | A frozen copy of the inputs a section job needs, stored in Redis for 4h and rebuilt for every new report (§16.5). Also the default `contextType`. |
+| **Point-in-time copy** | Data copied at one moment so later changes don't affect work already in progress. |
 | **contextType** | What a section is built from: `snapshot` (page content), `chronology`, doclist, `humanInput`. |
 | **Chronology** | A timeline section listing events in date order. |
 | **humanInput** | A section the report author writes by hand. |
@@ -785,6 +1221,24 @@ Today, facts are re-extracted on every run and thrown away afterwards. Persistin
 | **"Lazy answer" / truncation** | The model processes only part of its input but answers as if it had read everything. |
 | **Recall** | The share of the facts that *should* be in the report that actually are. Low recall means missing facts. |
 | **Precision** | The share of facts in the report that are correct and supported. |
+| **Effective context** | How much input a model can actually *use well* for a task, usually much less than its advertised window. |
+| **Lost in the middle** | Tendency of LLMs to miss details in the middle of long inputs while using the start and end well. |
+| **Needle in a haystack** | Common public test: can a model find one planted fact in a long text? It doesn't test extracting many facts at once. |
+| **Output limit** | The maximum text a model can *write* in one call; much smaller than what it can read. |
+| **Dispatch (facts)** | Sending each extracted fact to the report section where it belongs, removing cross-section duplicates. |
+| **Fact funnel** | Counting facts after each pipeline stage to see where they drop off. |
+| **Ingestion** | The one-time processing of a document when it enters the system: extract text, split, embed, store. |
+| **Chunk (two meanings)** | Here, *pipeline chunk* = a batch of pages sent to one LLM call. In general RAG, *RAG chunk* = a small piece of text that gets embedded. |
+| **Top-k** | The k most similar results returned by a vector search (e.g. the top 20 chunks). |
+| **Hybrid search** | Combining keyword search with vector (meaning-based) search. |
+| **Reranking** | A second step that re-orders search results by relevance, often with a more accurate model. |
+| **OCR** | Optical Character Recognition: turning scanned images of text into actual text. |
+| **Agent** | An LLM that can call tools (search, query, write, check), look at results and decide its next step. |
+| **Agentic report composition** | An agent builds the report by querying stored facts and filling gaps, instead of running a fixed pipeline. Proposed, not built (§16.4). |
+| **Fact store** | A proposed permanent database of extracted facts with source, page, date and type. Today facts are thrown away after each run. |
+| **Coverage record** | A proposed log of which pages were read, and which were judged irrelevant for which section, so gaps can be found. |
+| **Incremental processing** | Processing only what's new (e.g. newly added pages) instead of everything again. |
+| **Pass** | One complete run through something, start to finish, to do one job. Like an editor reading a whole book once before printing. A **whole-report pass** would read the finished report once to fix cross-section issues (not built yet). "First pass" means a first rough attempt; "two-pass" means the work is done in two rounds. |
 
 ### Engineering / infra terms
 
@@ -834,7 +1288,7 @@ Today, facts are re-extracted on every run and thrown away afterwards. Persistin
 
 ---
 
-## 17. Access Checklist
+## 19. Access Checklist
 
 | ✔ | Resource | What's needed |
 |---|---|---|
@@ -849,7 +1303,7 @@ Today, facts are re-extracted on every run and thrown away afterwards. Persistin
 
 ---
 
-## 18. Appendix: Key Paths and Links
+## 20. Appendix: Key Paths and Links
 
 ### Paths
 
