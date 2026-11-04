@@ -126,7 +126,7 @@ flowchart LR
   - Dates go to ISO format **with precision**: day, month or year only ("2023" ≠ "2023-01-01").
   - Clinical terms map to standard codes where it pays off: **SNOMED CT** (conditions and findings), **RxNorm** (drugs), **LOINC** (labs), **ICD-10** (diagnoses).
   - Providers and facilities link to entities (§4.4).
-- **Extraction is template-independent.** Extract *everything clinically meaningful* once per case. Templates later **select** from facts; they don't decide what gets extracted. This is what makes facts reusable and avoids per-section blind spots *(Handover §16.4)*.
+- **Extraction is mostly template-independent.** Extract *everything clinically meaningful* once per case. Templates later **select** from facts; they don't decide what gets extracted. This is what makes facts reusable and avoids per-section blind spots *(Handover §16.4)*. When a template needs something the general extraction didn't capture, **targeted extraction** fills the gap and saves the result (§5.12).
 
 ### 4.3 The knowledge store
 
@@ -373,7 +373,7 @@ flowchart LR
 ```
 
 - **Entity registry:** "Dr J. Smith", "John Smith MD" and "Smith, J." resolve to **one entity** with one display name. The same goes for facilities, medications (brand vs generic) and body parts.
-- **Style sheet (report bible):** shared by every section. It sets how the subject is named ("the claimant" vs "the patient"), date format, units, abbreviation rules and tone. Set at **organisation level** and overridable per template. *This is a likely meaning of the client's "org-wide context" (Handover §2.5, Q1).*
+- **Style sheet (report bible):** shared by every section. It sets how the subject is named ("the claimant" vs "the patient"), date format, units, abbreviation rules and tone. Set at **organisation level** and overridable per template.
 - **Standard codes** (SNOMED CT, RxNorm, ...) let different wordings for the same thing match.
 - **Lint after writing:** a code check replaces non-canonical names and flags banned terms. It's cheap and deterministic, with no LLM needed.
 
@@ -468,6 +468,111 @@ flowchart LR
 | Targeted fixes | No full reruns for small corrections |
 | Single retry budget | No retry multiplication *(Handover §9)* |
 
+### 5.12 When a template needs something that was never extracted
+
+If the LLM writes only from facts, what happens when a section needs information that isn't in the fact store? **This can happen.** It's the main weakness of a "facts only" design, and standard systems handle it with a fallback to the raw pages.
+
+#### When it happens
+
+| Cause | Example |
+|---|---|
+| **The fact schema has no slot for it** | The template wants "job duties before the injury", but no fact type exists for employment details |
+| **Extraction missed it** | The page was read, but the model didn't pull that detail out |
+| **The need isn't really a "fact"** | A verbatim quote of a doctor's opinion, or the tone of a letter |
+| **It's calculated, not stated** | "Total weeks off work", "number of physio sessions" |
+| **It isn't in the documents at all** | The examiner's own findings from the IME appointment |
+
+#### How standard designs handle it
+
+```mermaid
+flowchart LR
+    N[Section<br/>needs X] --> Q[Query<br/>fact store]
+    Q --> F{Found?}
+    F -- yes --> W[Write with<br/>citations]
+    F -- no --> S[Search raw pages<br/>hybrid search]
+```
+
+```mermaid
+flowchart LR
+    S[Pages found] --> T[Targeted<br/>extraction]
+    T --> SV[(Save as new<br/>facts: reused<br/>next time)]
+    SV --> W[Write with<br/>citations]
+    S -. nothing found .-> NF[State: not found<br/>in reviewed records]
+```
+
+| # | Mechanism | What it does |
+|---|---|---|
+| 1 | **Catch-all fact type** | The schema includes an "other observation" type (free text + citation), so anything clinically meaningful is stored even if no specific type fits |
+| 2 | **Check templates against the schema when they're built** | On template create or edit, check that every required field maps to a fact type. If one doesn't, add the type and **backfill**: extract only that type from existing cases, much cheaper than re-extracting everything |
+| 3 | **Raw pages stay searchable** | Pages stay indexed (keyword + vector). An empty query triggers a page search and targeted extraction, and the results are **saved as facts**, so the gap is closed for future reports |
+| 4 | **The right source for things that aren't facts** | Quotes become **passage** facts with exact text spans; calculations are done **in code** from facts; examiner findings are typed in by a person (*Sky already has `humanInput` sections, Handover §7.4*) |
+| 5 | **"Not found" instead of guessing** | e.g. "No record of pre-injury job duties found in the 412 pages reviewed." Defensible, and no hallucination |
+| 6 | **Monitor empty required fields** | Track per template how often required fields come back empty. A high rate points to a schema gap or a weak extraction prompt |
+
+#### The trade-off this reveals
+
+```mermaid
+flowchart LR
+    G[General extraction<br/>once per case<br/>common fact types] --> FS[(Fact store)]
+    T[Targeted extraction<br/>when a template<br/>needs more] --> FS
+    FS --> C[Compose]
+```
+
+- **Sky today** avoids this problem by extracting **per section**, guided by that section's instructions, so the template's needs drive extraction. The cost is that nothing is reusable, and pages judged irrelevant to a section lose their facts *(Handover §7.6)*.
+- **Pure template-independent extraction** is reusable, but can miss template-specific needs.
+- **The usual answer is a hybrid:** a **general extraction** once per case for common clinical fact types, plus **template-driven targeted extraction** on demand, saved for reuse. You get reuse **and** coverage of template-specific needs.
+
+### 5.13 Org-wide context (organisation documents)
+
+**What it is:** an organisation's whole set of its own documents, such as policy documents and guidelines, fed as context **in addition to** the case documents *(Handover §2.5)*.
+
+**What the client is really asking:** *how should users supply input* so that, even when it is huge, outputs stay predictable and flaws are **diagnosable**, so you can tell a context-window issue from anything else. The answer is mostly about **input structure**, and only partly about system internals.
+
+**Why it's hard:** org documents are a **second large input competing for the same context window** as the case pages. Putting all of them into every call is costly, dilutes attention, and makes failures hard to trace.
+
+#### Input structure: what users should provide
+
+Structure is broader than formatting. Clean files alone won't make huge inputs predictable.
+
+| Aspect | Meaning | Example |
+|---|---|---|
+| **Labelled** | Every input says what it is | Case document vs org policy; document type and date |
+| **Scoped** | Only what's needed is supplied | Pick the policies that apply to this report type, not the whole org dump |
+| **Consistent** | Same structure every time for a report type | Every IME report gets the same kinds of inputs, so runs are comparable |
+| **Measured** | The size of what went in is recorded | How much context each section actually used |
+
+#### Why structured input makes flaws traceable
+
+With structured, measured inputs, the *pattern* of errors points to the cause:
+
+| What you see | Likely cause |
+|---|---|
+| Errors grow as input size grows | **Context window** |
+| Errors only with certain document types | Parsing or extraction of those documents |
+| Errors at every input size | Prompt or template problem |
+| Errors only when certain policies are included | Conflicting or unclear org documents |
+
+#### How the system supports it
+
+```mermaid
+flowchart LR
+    O[Org documents<br/>policies · guidelines] --> I[Index once<br/>per org + version]
+    I --> R[Retrieve only the<br/>relevant passages<br/>per section]
+    R --> W[Write section]
+    F[(Case facts)] --> W
+    W --> T[Output cites<br/>case pages AND<br/>policy passages]
+```
+
+| Practice | What it does |
+|---|---|
+| **Keep org documents separate from case documents** | Index them once per organisation, not per case; they're reused across many reports |
+| **Retrieve, don't stuff** | Each section gets only the policy passages relevant to it (by section type, topic and hybrid search), not the whole set |
+| **Cite policy passages too** | Statements shaped by a policy cite the clause used, just as facts cite pages. This is the traceability the client asked for |
+| **Version the org documents** | Record which policy version each report used, so outputs are reproducible and explainable after a policy changes |
+| **Turn stable rules into settings** | Rules that never change per case (naming, formats, required sections) become organisation settings or the style sheet (§5.4), not text the LLM must re-read every time |
+| **Cache what repeats** | Org passages reused across many reports are ideal for prompt caching (§4.9) |
+| **Track context load** | Log how much of each call is case facts vs org passages. When quality drops, you can see whether context load was the cause |
+
 ---
 
 ## 6. Recommended Tech Stack (2026)
@@ -500,7 +605,7 @@ flowchart LR
 | Area | Sky today *(Handover ref)* | Industry standard | Gap size |
 |---|---|---|---|
 | Unit of work | Section text built from pages per run (§7) | Persistent typed facts | **Large** |
-| Extraction | Per section, after relevance filter (§7.1) | Once per case, template-independent | **Large** |
+| Extraction | Per section, after relevance filter (§7.1) | General once per case + targeted on demand (§5.12 here) | **Large** |
 | Duplicates | In-section merge; cross-section off (§5.5) | Store-level, case-wide, multi-layer | **Large** |
 | Contradictions | Not handled (§6) | Conflict records + policy + review | **Large** |
 | Naming | Independent sections (§6) | Entity registry + style sheet + lint | Medium |
@@ -533,7 +638,7 @@ flowchart LR
 | Phase | What | Why first / outcome |
 |---|---|---|
 | **0. Measure** | Finish report-gold eval; add a **recall** metric and per-stage **fact funnel**; grow the gold set | Know the baseline; answers "how large is our context capability?" with numbers *(Handover §17, Q18–Q19)* |
-| **1. Fact store + coverage** | Persist facts from today's pipeline into Postgres with sources and versions; add a coverage ledger; then move to template-independent extraction | Stops re-extracting on every run; makes gaps visible |
+| **1. Fact store + coverage** | Persist facts from today's pipeline into Postgres with sources and versions; add a coverage ledger; then move to general per-case extraction with targeted fallback (§5.12) | Stops re-extracting on every run; makes gaps visible |
 | **2. Consolidation** | Document-level dedup; key + similarity fact dedup; entity registry; conflict records | Fixes duplicates and contradictions at the source |
 | **3. Compose from facts** | Section specs query the store; code ordering; fact-ID citations; style sheet; post-write lint and consistency checks | Fixes naming, order and cross-section coherence |
 | **4. Review loop** | Fact-level edits, pinning, single-section regenerate, edit-rate tracking | 75% → 95% without reruns |
@@ -558,7 +663,7 @@ flowchart LR
 
 | Choice | Benefit | Cost / risk |
 |---|---|---|
-| Template-independent extraction | No section blind spots; reusable | More extraction up front, even for facts no template uses |
+| Template-independent extraction | No section blind spots; reusable | More extraction up front, even for facts no template uses; can miss template-specific needs, which needs a targeted fallback (§5.12) |
 | Fact store | Cheap reruns, measurable, editable | Schema design effort; migrations when fact types change |
 | Medical code normalization | Strong dedup and matching | Licensing (e.g. SNOMED CT is licensed per country), extra service cost |
 | Durable workflow engine | Reliability, visibility | New infrastructure to run and learn |
@@ -615,3 +720,8 @@ flowchart LR
 | **PIPEDA / PHIPA** | Canadian federal privacy law / Ontario's health privacy law |
 | **Zero data retention (ZDR)** | A provider setting where prompts and outputs aren't stored |
 | **Row-level security (RLS)** | Database rule that limits which rows each tenant can see |
+| **Catch-all fact type** | A generic "other observation" fact (free text + citation) for information no specific type covers |
+| **Passage fact** | A stored verbatim quote with its exact text span, for when wording matters |
+| **Backfill** | Running extraction for a newly added fact type over existing cases only |
+| **Targeted extraction** | Extracting one specific missing piece of information from selected pages, on demand |
+| **Hybrid extraction** | General extraction once per case plus targeted extraction when a template needs more |

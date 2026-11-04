@@ -106,7 +106,26 @@ flowchart LR
 ### 2.5 Ideas the client raised
 
 - **Look beyond the LLM.** Ask what the **user should provide as input** so that the variables are **traceable** and the output becomes **predictable**, even with "org-wide context". Then, when something goes wrong, you can tell **where** it failed, for example "this is a context-window issue".
-  - The notes don't define "org-wide context". It probably means settings or instructions shared across a client organisation. Ask the client to confirm.
+  - **"Org-wide context"** means feeding an organisation's **whole body of its own documents**, such as policy documents and guidelines, as context **in addition to** the case documents.
+  - Read this way, the client's point is about **how users supply input**, not LLM internals. Even when the input is huge (e.g. org-wide documents on top of the case), it should be **structured** so outputs stay **predictable** and failures are **diagnosable**: you can tell whether a flaw comes from the context window or from something else. Org documents are a **second large input competing for the same context window** as the case pages, which is why the client linked the two.
+  - **Structure is broader than formatting.** Good input is:
+
+    | Aspect | Meaning | Example |
+    |---|---|---|
+    | **Labelled** | Every input says what it is | Case document vs org policy; document type and date |
+    | **Scoped** | Only what's needed is supplied | The policies that apply to this report type, not the whole org dump |
+    | **Consistent** | Same structure every time for a report type | Every IME report gets the same kinds of inputs, so runs are comparable |
+    | **Measured** | The size of what went in is recorded | How much context each section actually used |
+
+  - **Why it makes failures traceable:** with structured, measured inputs, the *pattern* of errors points to the cause.
+
+    | What you see | Likely cause |
+    |---|---|
+    | Errors grow as input size grows | **Context window** |
+    | Errors only with certain document types | Parsing or extraction of those documents |
+    | Errors at every input size | Prompt or template problem |
+    | Errors only when certain policies are included | Conflicting or unclear org documents |
+  - The handover doesn't describe how organisation documents are supplied to the system today, if at all.
 
 ### 2.6 The four questions candidates should answer
 
@@ -1123,7 +1142,7 @@ flowchart LR
 
 | ✔ | # | Question | Why it matters | Ref |
 |---|---|---|---|---|
-| [ ] | Q1 | What does "org-wide context" mean: settings, instructions or reference material shared across a client organisation? | Shapes what users should provide as input to make output predictable | §2.5 |
+| [x] | Q1 | ~~What does "org-wide context" mean?~~ **Answered:** an organisation's whole set of its own documents (e.g. policy documents) fed as context alongside case documents. *Follow-up:* how are org documents supplied today, if at all? | Org documents add to context load and must be traceable in outputs | §2.5 |
 
 ### 17.2 Ask Sergei or the owners of other services
 
@@ -1192,7 +1211,7 @@ flowchart LR
 | **HITL (Human In The Loop)** | A person who reviews and corrects AI output before it's final. Here, IME firms and admin staff who prepare reports for doctors. |
 | **Medical summary** | A condensed overview of a patient's medical history and findings. |
 | **Sign-off** | The doctor's final approval of a report. |
-| **Org-wide context** | Term from the client call; probably settings or instructions shared across a client organisation. Not defined in the notes. |
+| **Org-wide context** | An organisation's whole set of its own documents (e.g. policy documents, guidelines) fed to the system as context alongside the case documents. |
 | **Second round** | The next step in choosing who takes over the system: candidates propose approaches based on this handover. |
 
 ### AI / LLM terms
